@@ -48,6 +48,7 @@ include $(ASTTOPDIR)/Makefile.moddir_rules
 	echo "</member>" >> $@
 
 $(call MOD_ADD_C,app_confbridge,$(wildcard confbridge/*.c))
+$(call MOD_ADD_C,app_amd,$(wildcard amd/*.c))
 
 app_confbridge.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
 app_meetme.o: _ASTCFLAGS+=$(AST_NO_FORMAT_TRUNCATION)
