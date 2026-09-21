@@ -52,6 +52,8 @@
 #include "asterisk/app.h"
 #include "asterisk/format_cache.h"
 
+#include "amd/signature.h"
+
 /*** DOCUMENTATION
 	<application name="AMD" language="en_US">
 		<since>
@@ -109,6 +111,13 @@
 			<para>When loaded, AMD reads amd.conf and uses the parameters specified as
 			default values. Those default values get overwritten when the calling AMD
 			with parameters.</para>
+			<para>If the <literal>[signature]</literal> section of amd.conf names reference
+			recordings in <literal>templates</literal>, AMD also compares the audio against
+			them and returns <literal>SCREENED</literal> as soon as one matches. This is meant
+			for call screening services, such as the one recent iOS versions offer, which answer
+			with a fixed recorded prompt that AMD would otherwise classify as a MACHINE. The
+			recordings are resolved in the channel language, like any other sound file. Without
+			the section, AMD behaves exactly as it always has.</para>
 			<para>This application sets the following channel variables:</para>
 			<variablelist>
 				<variable name="AMDSTATUS">
@@ -117,6 +126,7 @@
 					<value name="HUMAN" />
 					<value name="NOTSURE" />
 					<value name="HANGUP" />
+					<value name="SCREENED" />
 				</variable>
 				<variable name="AMDCAUSE">
 					<para>Indicates the cause that led to the conclusion</para>
@@ -137,6 +147,10 @@
 					</value>
 					<value name="MAXWORDS">
 						Word Count - maximum number of words.
+					</value>
+					<value name="SIGNATURE">
+						Template - Score: the reference recording which matched, and the
+						similarity it reached, from 0 to 100.
 					</value>
 				</variable>
 			</variablelist>
@@ -177,6 +191,7 @@ static void isAnsweringMachine(struct ast_channel *chan, const char *data)
 	int audioFrameCount = 0;
 	struct ast_frame *f = NULL;
 	struct ast_dsp *silenceDetector = NULL;
+	struct amd_signature *signature = NULL;
 	struct timeval amd_tvstart;
 	int dspsilence = 0, framelength = 0;
 	RAII_VAR(struct ast_format *, readFormat, NULL, ao2_cleanup);
@@ -300,6 +315,9 @@ static void isAnsweringMachine(struct ast_channel *chan, const char *data)
 	/* Set silence threshold to specified value */
 	ast_dsp_set_threshold(silenceDetector, silenceThreshold);
 
+	/* Recognise a known recorded prompt, if amd.conf names any */
+	signature = amd_signature_start(chan);
+
 	/* Set our start time so we can tie the loop to real world time and not RTP updates */
 	amd_tvstart = ast_tvnow();
 
@@ -364,6 +382,17 @@ static void isAnsweringMachine(struct ast_channel *chan, const char *data)
 				ast_frfree(f);
 				strcpy(amdStatus , "NOTSURE");
 				sprintf(amdCause , "TOOLONG-%d", iTotalTime);
+				break;
+			}
+
+			/* A recognised prompt is conclusive, and has to beat MACHINE on the same frame */
+			if (amd_signature_feed(signature, f)) {
+				ast_verb(3, "AMD: Channel [%s]. SCREENED: signature [%s] score [%d]\n",
+					ast_channel_name(chan), amd_signature_name(signature), amd_signature_score(signature));
+				ast_frfree(f);
+				strcpy(amdStatus , "SCREENED");
+				snprintf(amdCause, sizeof(amdCause), "SIGNATURE-%s-%d",
+					amd_signature_name(signature), amd_signature_score(signature));
 				break;
 			}
 
@@ -489,6 +518,7 @@ static void isAnsweringMachine(struct ast_channel *chan, const char *data)
 
 	/* Free the DSP used to detect silence */
 	ast_dsp_free(silenceDetector);
+	amd_signature_free(signature);
 
 	/* If we were playing something to pass the time, stop it now. */
 	if (!ast_strlen_zero(audioFile)) {
@@ -568,6 +598,8 @@ static int load_config(int reload)
 		cat = ast_category_browse(cfg, cat);
 	}
 
+	amd_signature_load_config(cfg);
+
 	ast_config_destroy(cfg);
 
 	ast_verb(5, "AMD defaults: initialSilence [%d] greeting [%d] afterGreetingSilence [%d] "
@@ -580,13 +612,17 @@ static int load_config(int reload)
 
 static int unload_module(void)
 {
+	int res;
+
 	ast_mutex_lock(&config_lock);
 	if (dfltAudioFile) {
 		ast_free(dfltAudioFile);
 	}
 	ast_mutex_unlock(&config_lock);
 	ast_mutex_destroy(&config_lock);
-	return ast_unregister_application(app);
+	res = ast_unregister_application(app);
+	amd_signature_cleanup();
+	return res;
 }
 
 /*!
@@ -602,7 +638,11 @@ static int unload_module(void)
 static int load_module(void)
 {
 	ast_mutex_init(&config_lock);
+	if (amd_signature_init()) {
+		return AST_MODULE_LOAD_DECLINE;
+	}
 	if (load_config(0) || ast_register_application_xml(app, amd_exec)) {
+		amd_signature_cleanup();
 		return AST_MODULE_LOAD_DECLINE;
 	}
 

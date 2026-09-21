@@ -30,3 +30,67 @@ between_words_silence = 50	; Minimum duration of silence after a word to conside
 
 maximum_number_of_words = 2	; Maximum number of words in the greeting
 				; If exceeded, then the result is detection as a MACHINE
+
+; Known prompt detection ;
+;
+; When templates are given here, AMD() also matches the caller's audio against
+; reference recordings of known call screening prompts, such as the one recent
+; iOS versions play before connecting a human, and returns AMDSTATUS=SCREENED
+; with AMDCAUSE=SIGNATURE-<template>-<score> as soon as one matches. Without
+; this, AMD() classifies those prompts as MACHINE, because on energy and timing
+; features they are one. The match typically comes several hundred
+; milliseconds before AMD() would have reached MACHINE on the same audio.
+;
+; Without this section AMD() behaves exactly as it always has.
+;
+; "amd signature test" scores recordings against a reference from the CLI, and
+; "amd signature show templates" lists the recordings loaded so far.
+;
+;[signature]
+;templates = ios-screening-1&ios-screening-2&ios-screening-3&ios-screening-4&ios-screening-5&ios-screening-6
+				; Reference recordings to match against, separated by '&'.
+				; Resolved like any other sound file, including the channel
+				; language, so the recordings above are looked up as
+				; fr/ios-screening-1 and so on for a French channel.
+				;
+				; A handset plays the prompt in whichever voice it is set to,
+				; and the voices do not match each other, so one recording is
+				; needed per voice, and sometimes more than one where a voice
+				; has been heard with different intonation. Above, 1 to 4 are
+				; the prompt captured by hand from each of four voices,
+				; trimmed of silence, and 5 and 6 are cut from real calls
+				; which none of those matched: a second rendition of voice 2,
+				; and a fifth voice.
+				;
+				; Choose and check the set against labelled calls with
+				; contrib/scripts/amd_signature_sweep.py. Recordings are
+				; cached once loaded, and the cache is only dropped when this
+				; file changes: after replacing a recording, touch this file
+				; before reloading.
+;threshold = 95			; Similarity, from 0 to 100, at or above which a recording is
+				; considered to match.
+;template_length = 3000		; How much of each recording to keep, in milliseconds. This is
+				; not how much is compared at a time: a call is compared
+				; against match_window of it, tried at every offset_step
+				; within it. A longer template therefore tolerates more of the
+				; prompt being missing from the call, which is what happens
+				; when a call is answered late, without needing a separate
+				; recording for each amount of loss. 3000 covers being up to
+				; 1800ms late; beyond that adds nothing.
+;match_window = 1200		; How much audio is compared at a time, in milliseconds. Lower
+				; gives a faster verdict, but 1200 is the shortest that keeps
+				; the threshold forgiving: below it the useful range becomes a
+				; knife edge rather than a broad plateau.
+;offset_step = 100		; How finely the match window is stepped through the template.
+				; This costs no alignment precision, since the audio itself is
+				; still compared every 10ms; the step only has to be fine
+				; enough that some offset is at least as large as the missing
+				; audio.
+;silence_threshold = 256	; Minimum mean sample level, on a scale of 0 to 32767, for a
+				; window of audio to be allowed to match. Matching ignores
+				; absolute level so that a quiet prompt matches a loud
+				; reference, which means near silence also has a shape and can
+				; score deceptively high; two calls in a sample of 546 scored
+				; over 91 on stretches thirty times quieter than the quietest
+				; real prompt. Same measure and default as silence_threshold
+				; in [general].
