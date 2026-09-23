@@ -26,6 +26,27 @@ A reference cut from a call of the corpus matches that call perfectly, which
 says nothing about the calls it has not heard. Such a reference is recognised,
 the whole of it reappearing in the recording, and not scored on that call.
 
+Two matchers the module does not have yet can be evaluated before they are
+written in C:
+
+--alignment local replaces the fixed windows with a single open-begin
+alignment over the whole reference, which tolerates the tempo of another
+rendition: dynamic time warping with local slopes of 0.5 to 2, a penalty on
+every step off the diagonal, and a path allowed to start anywhere in the
+reference and in the call. A path scores the mean similarity over the
+reference frames it covers, and counts once it spans a match window. Frames
+are liftered to their first six cepstral coefficients, which keeps the
+spectral envelope and drops the pitch harmonics a narrow band resolves, so
+that another voice's intonation does not cost similarity. Scores are no longer
+whole percentages, and the thresholds may be given in tenths.
+
+--average replaces each reference by the average of every screened call of
+its voice. Each such call is assigned the reference it aligns with best, and
+its prompt is cut out and averaged with the reference by DTW barycenter
+averaging. A screened call is only scored by an average built without it, so
+the figures are those of calls the set has not heard. An averaged reference
+exists only as features: AMD() cannot load it.
+
 A corpus is a directory of <call>.wav, 8 kHz mono 16-bit, each with a
 <call>.json sidecar carrying a "label". Requires numpy.
 
@@ -33,11 +54,13 @@ Usage:
   amd_signature_sweep.py --corpus DIR --templates ref1.wav ref2.wav ...
   amd_signature_sweep.py --corpus DIR               # choose a set from the corpus
   amd_signature_sweep.py --corpus DIR --config amd.conf --thresholds 94,95,96
+  amd_signature_sweep.py --corpus DIR --templates ... --alignment local --average
   amd_signature_sweep.py --self-test
 """
 
 import argparse
 import collections
+import copy
 import glob
 import json
 import os
@@ -79,6 +102,15 @@ HOPS_PER_FRAME = amd_replay.FRAME_MS // HOP_MS
 # Mean similarity over a whole reference above which it is taken to be cut
 # from the recording itself. The same rendition from another call stays under 0.98.
 SELF_CUT = 0.995
+
+# --alignment local: the similarity a step must beat to extend a path, and the
+# cost of a step off the diagonal, per active reference frame.
+THETA = 0.90
+WARP_PENALTY = 0.20
+# Cepstral coefficients kept by the lifter, c0 being zero after mean removal.
+NCEPS = 6
+LIFTER = np.cos(np.pi * np.arange(1, NCEPS + 1)[:, None] * (np.arange(NBANDS) + 0.5) / NBANDS)
+DBA_ITERATIONS = 10
 
 
 def biquads():
@@ -164,14 +196,38 @@ def features(x):
     return v / norm, total[:, 0], level
 
 
+def unit(v):
+    norm = np.linalg.norm(v, axis=1, keepdims=True)
+    norm[norm == 0] = 1
+    return v / norm
+
+
+def lift(v):
+    """Spectral shapes reduced to their first cepstral coefficients, unit length."""
+    return unit(v @ LIFTER.T)
+
+
+def log_power(total):
+    return np.log(total + 1e-9)
+
+
 class Template:
     """A reference cut into windows, as sig_template_build() does it."""
 
     def __init__(self, name, x, sig):
-        self.name = name
         v, total, _ = features(x)
         if v is None:
             raise ValueError("%s: no audio" % name)
+        self._build(name, v, total, sig)
+
+    @classmethod
+    def from_features(cls, name, v, total, sig):
+        tmpl = cls.__new__(cls)
+        tmpl._build(name, v, total, sig)
+        return tmpl
+
+    def _build(self, name, v, total, sig):
+        self.name = name
         self.onset = int(np.argmax(total >= total.max() * ONSET))
         self.win = sig["match_window"] // HOP_MS
         step = max(1, sig["offset_step"] // HOP_MS)
@@ -187,6 +243,13 @@ class Template:
             act = seg >= seg.max() * GATE
             if act.any():
                 self.windows.append((base, act, int(act.sum())))
+        # For --alignment local and --average: the same gate against the
+        # loudest frame within half a window either side.
+        self.total = energy
+        self.lifted = lift(self.frames)
+        h = self.win // 2
+        self.act = np.array([energy[i] >= energy[max(0, i - h): i + h].max() * GATE
+                             for i in range(length)], dtype=float)
 
 
 def to_percent(s):
@@ -214,6 +277,147 @@ def score_hops(tmpl, v):
         diag = np.lib.stride_tricks.as_strided(g[:, base:], shape=(n, win), strides=(s0, s0 + s1))
         best = np.maximum(best, diag @ act / count)
     return to_percent(best)
+
+
+def score_local(tmpl, frames, theta=THETA, penalty=WARP_PENALTY):
+    """--alignment local: the score at each hop of each call in frames, indexed
+    as score_hops() indexes it.
+
+    A local alignment on similarity: stepping onto reference frame i at call
+    hop j gains act_i * (t_i . v_j - theta), less penalty * act_i for a step
+    off the diagonal, and a path restarts wherever every way into it is
+    negative. Steps are (1,1), (1,2), which skips a call hop, and (2,1), which
+    covers two reference frames in one hop. Each cell carries where its path
+    started in the reference and the active frames it covered, A, so its
+    score theta + H / A is the mean similarity over them less the penalties.
+    A hop scores the best path spanning at least a match window.
+
+    Every way into a cell comes from an earlier hop, so a whole column is
+    computed at once, for all calls together. Calls are taken longest first so
+    that the ones still running are a prefix.
+    """
+    T, act, span = tmpl.lifted, tmpl.act, tmpl.win
+    W = len(T)
+    lens = np.array([len(f) for f in frames])
+    order = np.argsort(-lens, kind="stable")
+    C = np.zeros((len(frames), lens.max(), T.shape[1]))
+    for row, k in enumerate(order):
+        C[row, :lens[k]] = frames[k]
+    pen = penalty * act
+    idx = np.arange(W)
+    shape = (len(frames), W)
+    H1, H2 = np.full(shape, -np.inf), np.full(shape, -np.inf)
+    A1, A2 = np.zeros(shape), np.zeros(shape)
+    S1, S2 = np.zeros(shape, dtype=int), np.zeros(shape, dtype=int)
+    out = np.zeros((len(frames), lens.max()))
+    for j in range(lens.max()):
+        m = int((lens > j).sum())
+        g = act * (C[:m, j] @ T.T - theta)
+        H = np.zeros((m, W))
+        A = np.zeros((m, W))
+        S = np.broadcast_to(idx, (m, W)).copy()
+        for h, a, s, i0 in ((H1[:m, :-1], A1[:m, :-1], S1[:m, :-1], 1),
+                            (H2[:m, :-1] - pen[1:], A2[:m, :-1], S2[:m, :-1], 1),
+                            (H1[:m, :-2] + g[:, 1:-1] - pen[2:], A1[:m, :-2] + act[1:-1], S1[:m, :-2], 2)):
+            better = h > H[:, i0:]
+            H[:, i0:] = np.where(better, h, H[:, i0:])
+            A[:, i0:] = np.where(better, a, A[:, i0:])
+            S[:, i0:] = np.where(better, s, S[:, i0:])
+        H += g
+        A += act
+        spans = (idx - S + 1 >= span) & (A > 0)
+        out[:m, j] = np.where(spans, 100.0 * (theta + H / np.where(A > 0, A, 1)), 0).max(1)
+        H2[:m], A2[:m], S2[:m] = H1[:m], A1[:m], S1[:m]
+        H1[:m], A1[:m], S1[:m] = H, A, S
+    scores = [None] * len(frames)
+    for row, k in enumerate(order):
+        scores[k] = np.maximum(out[row, span - 1: lens[k]], 0)
+    return scores
+
+
+def _dtw(c, penalty, free_start):
+    """Cumulative cost over c (reference frames by call hops) with the steps of
+    score_local(), each reference frame costed once, and the step taken into
+    each cell: 0 for (1,1), 1 for (1,2), 2 for (2,1)."""
+    W, N = c.shape
+    D = np.full((W, N), np.inf)
+    step = np.zeros((W, N), dtype=np.int8)
+    if free_start:
+        D[0] = c[0]
+    else:
+        D[0, 0] = c[0, 0]
+    for i in range(1, W):
+        best = np.full(N, np.inf)
+        best[1:] = D[i - 1, :-1]
+        cand = np.full(N, np.inf)
+        cand[2:] = D[i - 1, :-2] + penalty
+        better = cand < best
+        best[better] = cand[better]
+        step[i, better] = 1
+        if i >= 2:
+            cand = np.full(N, np.inf)
+            cand[1:] = D[i - 2, :-1] + c[i - 1, 1:] + penalty
+            better = cand < best
+            best[better] = cand[better]
+            step[i, better] = 2
+        D[i] = best + c[i]
+    return D, step
+
+
+def _backtrack(step, i, j):
+    """Reference and call indices along the path ending at (i, j), every call
+    hop and reference frame it passes through included."""
+    pairs = [(i, j)]
+    while i > 0:
+        kind = step[i, j]
+        if kind == 0:
+            i, j = i - 1, j - 1
+        elif kind == 1:
+            pairs.append((i, j - 1))
+            i, j = i - 1, j - 2
+        else:
+            pairs.append((i - 1, j))
+            i, j = i - 2, j - 1
+        pairs.append((i, j))
+    pairs = np.array(pairs)
+    return pairs[:, 0], pairs[:, 1]
+
+
+def locate(ref, x, penalty=WARP_PENALTY):
+    """Where lifted reference frames ref best fit within lifted frames x:
+    (mean cost per reference frame, first hop, last hop)."""
+    D, step = _dtw(1 - ref @ x.T, penalty, free_start=True)
+    end = int(np.argmin(D[-1]))
+    _, hops = _backtrack(step, len(ref) - 1, end)
+    return D[-1, end] / len(ref), int(hops.min()), end
+
+
+def average(init, members, penalty=WARP_PENALTY, iterations=DBA_ITERATIONS):
+    """DTW barycenter averaging of (v, log total) sequences on init's time axis.
+
+    Each pass aligns every member to the current average end to end and
+    replaces each frame of the average by the mean of the member frames
+    aligned to it: spectral shapes renormalised as features() leaves them, log
+    power averaged. Alignment is on the liftered shapes.
+    """
+    v, logt = init
+    for _ in range(iterations):
+        acc_v = np.zeros_like(v)
+        acc_l = np.zeros(len(v))
+        count = np.zeros(len(v))
+        ref = lift(v)
+        for mv, ml in members:
+            D, step = _dtw(1 - ref @ lift(mv).T, penalty, free_start=False)
+            if not np.isfinite(D[-1, -1]):
+                raise ValueError("cannot align sequences of %d and %d hops" % (len(v), len(mv)))
+            i, j = _backtrack(step, len(v) - 1, len(mv) - 1)
+            np.add.at(acc_v, i, mv[j])
+            np.add.at(acc_l, i, ml[j])
+            np.add.at(count, i, 1)
+        acc_v /= count[:, None]
+        v = unit(acc_v - acc_v.mean(1, keepdims=True))
+        logt = acc_l / count
+    return v, logt
 
 
 def window_levels(level, win):
@@ -297,6 +501,19 @@ def load_corpus(dirname, cfg, sig):
     return calls
 
 
+def call_scores(tmpl, calls, alignment):
+    """Per call, the score at each hop, or None for a call too short to score."""
+    live = [k for k, c in enumerate(calls) if c["features"] is not None]
+    out = [None] * len(calls)
+    if alignment == "local":
+        for k, s in zip(live, score_local(tmpl, [lift(calls[k]["features"]) for k in live])):
+            out[k] = s
+    else:
+        for k in live:
+            out[k] = score_hops(tmpl, calls[k]["features"])
+    return out
+
+
 def full_features(call):
     """Features of the whole recording, not only what AMD listened to."""
     if "full" not in call:
@@ -327,20 +544,19 @@ def self_cuts(templates, calls, positive):
     return found
 
 
-def hit_matrix(templates, calls, thresholds, mask=None):
+def hit_matrix(templates, calls, thresholds, alignment="rigid", mask=None):
     """For each threshold, the hop count each template first matches each call at.
 
     np.inf where it never does before AMD's own verdict, or where mask, a
     template by call array, is False.
     """
     out = {t: np.full((len(templates), len(calls)), np.inf) for t in thresholds}
-    best = np.zeros((len(templates), len(calls)), dtype=int)
+    best = np.zeros((len(templates), len(calls)))
     for i, tmpl in enumerate(templates):
+        per_call = call_scores(tmpl, calls, alignment)
         for k, call in enumerate(calls):
-            if call["features"] is None or (mask is not None and not mask[i, k]):
-                continue
-            scores = score_hops(tmpl, call["features"])
-            if not len(scores):
+            scores = per_call[k]
+            if scores is None or not len(scores) or (mask is not None and not mask[i, k]):
                 continue
             loud = call["loud"][: len(scores)]
             best[i, k] = scores[loud].max() if loud.any() else 0
@@ -375,16 +591,21 @@ def report(templates, calls, hits, best, thresholds, report_at, positive):
         fp = [k for k in neg if np.isfinite(first[k])]
         lat = [verdict(first[k], calls[k])[1] for k in det]
         lead = [calls[k]["amd"][2] - verdict(first[k], calls[k])[1] for k in det]
-        print("%8d %8d/%-5d %8d/%-7d %s%s" % (
+        print("%8g %8d/%-5d %8d/%-7d %s%s" % (
             t, len(det), len(pos), len(fp), len(neg),
             "median %d, p90 %d; lead median %d, min %d" % (
                 np.median(lat), np.percentile(lat, 90), np.median(lead), min(lead)) if det else "",
             "   " + ", ".join("%s %d" % kv for kv in collections.Counter(calls[k]["label"] for k in fp).items())
             if fp else ""))
+    if pos and neg:
+        weakest = min(best[:, k].max() for k in pos)
+        strongest = max(best[:, k].max() for k in neg)
+        print("\nmargin %+.1f: weakest %s call scores %.1f, strongest other call %.1f" % (
+            weakest - strongest, positive, weakest, strongest))
 
     first = hits[report_at].min(0)
     who = hits[report_at].argmin(0)
-    print("\n=== at threshold %d: label (row) against AMD() verdict (column) ===" % report_at)
+    print("\n=== at threshold %g: label (row) against AMD() verdict (column) ===" % report_at)
     cols = ["SCREENED", "MACHINE", "HUMAN", "NOTSURE"]
     print("%-10s" % "label" + "".join("%10s" % c for c in cols))
     for label in labels:
@@ -403,7 +624,7 @@ def report(templates, calls, hits, best, thresholds, report_at, positive):
         print("\nmissed %s calls (best loud score, AMD verdict):" % positive)
         for k in missed:
             status, cause, ms = calls[k]["amd"]
-            print("  %-44s %3d   %s/%s at %dms" % (calls[k]["name"], best[:, k].max(), status, cause, ms))
+            print("  %-44s %5.1f   %s/%s at %dms" % (calls[k]["name"], best[:, k].max(), status, cause, ms))
 
     if pos:
         lead = sorted((calls[k]["amd"][2] - verdict(first[k], calls[k])[1], k)
@@ -416,7 +637,7 @@ def report(templates, calls, hits, best, thresholds, report_at, positive):
     closest = sorted(neg, key=lambda k: -best[:, k].max())[:5]
     print("\nhighest loud scores among the other calls (check these for mislabels):")
     for k in closest:
-        print("  %3d  %-9s %s" % (best[:, k].max(), calls[k]["label"], calls[k]["name"]))
+        print("  %5.1f  %-9s %s" % (best[:, k].max(), calls[k]["label"], calls[k]["name"]))
 
 
 def greedy_cover(detects, members):
@@ -444,7 +665,7 @@ def greedy_cover(detects, members):
     return chosen, covered
 
 
-def cmd_select(calls, sig, thresholds, report_at, positive):
+def cmd_select(calls, sig, thresholds, report_at, positive, alignment):
     """Choose a set from the corpus' own positives, and cross-validate the choice."""
     pos = [k for k, c in enumerate(calls) if c["label"] == positive]
     neg = [k for k, c in enumerate(calls) if c["label"] != positive]
@@ -455,7 +676,7 @@ def cmd_select(calls, sig, thresholds, report_at, positive):
             owner.append(k)
         except ValueError as exc:
             print("  skipped: %s" % exc)
-    hits, best = hit_matrix(candidates, calls, thresholds)
+    hits, best = hit_matrix(candidates, calls, thresholds, alignment)
     n = len(candidates)
     # detects[i, j]: candidate i catches the positive candidate j was cut from
     col = {k: j for j, k in enumerate(owner)}
@@ -474,11 +695,11 @@ def cmd_select(calls, sig, thresholds, report_at, positive):
             if any(detects[i, j] for i in subset):
                 held += 1
         fp = sum(1 for k in neg if any(np.isfinite(hits[t][i, k]) for i in chosen))
-        print("%8d %10d %6d/%-3d %14d/%-3d (%5.1f%%) %6d/%-4d" % (
+        print("%8g %10d %6d/%-3d %14d/%-3d (%5.1f%%) %6d/%-4d" % (
             t, len(chosen), len(covered), n, held, n, 100.0 * held / max(1, n), fp, len(neg)))
 
     chosen = chosen_at[report_at]
-    print("\n=== chosen at threshold %d ===" % report_at)
+    print("\n=== chosen at threshold %g ===" % report_at)
     for i in chosen:
         reach = int(np.isfinite(hits[report_at][i, owner]).sum())
         print("  %s.wav  onset %dms  covers %d%s" % (
@@ -493,14 +714,90 @@ def cmd_select(calls, sig, thresholds, report_at, positive):
            {t: hits[t][chosen] for t in thresholds}, best[chosen], thresholds, report_at, positive)
 
 
-def cmd_templates(templates, calls, thresholds, report_at, positive):
+def cmd_templates(templates, calls, thresholds, report_at, positive, alignment):
     """Evaluate a reference set, never scoring a reference on its own call."""
     mask = np.ones((len(templates), len(calls)), dtype=bool)
     for i, k in self_cuts(templates, calls, positive).items():
         print("%s is cut from %s, so it is not scored on that call" % (templates[i].name, calls[k]["name"]))
         mask[i, k] = False
-    hits, best = hit_matrix(templates, calls, thresholds, mask)
+    hits, best = hit_matrix(templates, calls, thresholds, alignment, mask)
     report(templates, calls, hits, best, thresholds, report_at, positive)
+
+
+def cmd_average(refs, calls, sig, thresholds, report_at, positive, alignment):
+    """Average each reference with the positive calls of its voice, and
+    evaluate the averages leave-one-out."""
+    pos = [k for k, c in enumerate(calls) if c["label"] == positive]
+    cut = self_cuts(refs, calls, positive)
+    cut_from = {k: i for i, k in cut.items()}
+
+    # Each positive goes to the reference it aligns with best, and the stretch
+    # of its recording that reference aligns to is its instance of the prompt.
+    voice, inst = {}, {}
+    for k in pos:
+        v, total, _ = full_features(calls[k])
+        if v is None:
+            continue
+        lv = lift(v)
+        fits = [locate(r.lifted, lv) for r in refs]
+        i = int(np.argmin([f[0] for f in fits]))
+        _, first, last = fits[i]
+        voice[k] = i
+        inst[k] = (v[first:last + 1], log_power(total[first:last + 1]))
+
+    def build(i, without=None):
+        # A reference cut from a call is that call's instance already, and
+        # must not be the starting point of an average built without it.
+        ref = (refs[i].frames, log_power(refs[i].total))
+        members = [inst[k] for k in pos if voice.get(k) == i and k != without]
+        if i not in cut:
+            members.append(ref)
+        if not members:
+            return None
+        init = members[0] if without is not None and cut.get(i) == without else ref
+        v, logt = average(init, members)
+        return Template.from_features(refs[i].name, v, np.exp(logt), sig)
+
+    print("averaging %d positive calls onto %d references:" % (len(voice), len(refs)))
+    for i, r in enumerate(refs):
+        print("  %-30s %3d calls%s" % (r.name, sum(1 for k in voice if voice[k] == i),
+                                       "   (cut from %s)" % calls[cut[i]]["name"] if i in cut else ""))
+    full = [build(i) for i in range(len(refs))]
+    loo = {k: build(voice[k], without=k) for k in voice}
+
+    # A positive is scored by the averages of the other voices and by its own
+    # voice's built without it; every other call by all of them.
+    templates, owner = [], []
+    for i, t in enumerate(full):
+        if t is not None:
+            templates.append(t)
+            owner.append(i)
+    nfull = len(templates)
+    held = {}
+    for k, t in loo.items():
+        if t is not None:
+            held[k] = len(templates)
+            templates.append(t)
+            owner.append(voice[k])
+    mask = np.ones((len(templates), len(calls)), dtype=bool)
+    for k in pos:
+        mask[:, k] = False
+        mask[[j for j in range(nfull) if owner[j] != voice.get(k)], k] = True
+        if k in held:
+            mask[held[k], k] = True
+    print("scoring %d averages (%d leave-one-out)\n" % (len(templates), len(held)))
+    hits, best = hit_matrix(templates, calls, thresholds, alignment, mask)
+
+    # Report one row per voice: the first match among its averages.
+    rows = sorted(set(owner))
+    hits = {t: np.vstack([h[[j for j in range(len(templates)) if owner[j] == i]].min(0) for i in rows])
+            for t, h in hits.items()}
+    best = np.vstack([best[[j for j in range(len(templates)) if owner[j] == i]].max(0) for i in rows])
+    shown = []
+    for i in rows:
+        shown.append(copy.copy(full[i] if full[i] is not None else refs[i]))
+        shown[-1].name = "average of " + refs[i].name
+    report(shown, calls, hits, best, thresholds, report_at, positive)
 
 
 def self_test():
@@ -567,6 +864,63 @@ def self_test():
           "%d quiet hops over the threshold ignored" % (delta, first, matched, quiet))
     if delta or first != matched or matched is None or not quiet:
         sys.exit("scorers disagree, or the test no longer reaches every branch")
+
+    # --alignment local: the column-at-a-time scorer against the recursion
+    # written cell by cell, on the same call and, to exercise the batching of
+    # calls of unequal length, on the call and a prefix of it together.
+    lv = lift(v)
+    T, act = tmpl.lifted, tmpl.act
+    prev1 = prev2 = [(-np.inf, 0.0, 0)] * len(T)
+    direct = []
+    for j in range(len(lv)):
+        g = act * (T @ lv[j] - THETA)
+        cur, score_best = [], 0.0
+        for i in range(len(T)):
+            h, a, start = 0.0, 0.0, i
+            ways = []
+            if i >= 1:
+                ways.append(prev1[i - 1])
+                ways.append((prev2[i - 1][0] - WARP_PENALTY * act[i], prev2[i - 1][1], prev2[i - 1][2]))
+            if i >= 2:
+                ways.append((prev1[i - 2][0] + g[i - 1] - WARP_PENALTY * act[i],
+                             prev1[i - 2][1] + act[i - 1], prev1[i - 2][2]))
+            for way in ways:
+                if way[0] > h:
+                    h, a, start = way
+            cur.append((h + g[i], a + act[i], start))
+            if i - start + 1 >= win and a + act[i] > 0:
+                score_best = max(score_best, 100.0 * (THETA + (h + g[i]) / (a + act[i])))
+        direct.append(score_best)
+        prev1, prev2 = cur, prev1
+    direct = np.array(direct[win - 1:])
+    whole, part = score_local(tmpl, [lv, lv[:len(lv) // 2]])
+    delta = max(np.abs(whole - direct).max(), np.abs(part - whole[:len(part)]).max())
+    first = first_hit(whole, loud, sig["threshold"])
+    print("local alignment vs the cell by cell recursion: max score difference %.1e, "
+          "first match at hop %s" % (delta, None if first is None else first + win))
+    if delta > 1e-9 or first is None:
+        sys.exit("local alignment scorers disagree, or the reference is not found")
+
+    # --average: the reference placed among unrelated frames is found where it
+    # was put, and averaging it with itself, and with a copy played slower,
+    # gives back the reference.
+    # Digital silence between the syllables leaves frames with no shape at
+    # all, which match nothing, themselves included.
+    shaped = np.linalg.norm(tmpl.lifted, axis=1) > 0
+    noise = unit(rng.randn(200, NCEPS))
+    cost, begin, end = locate(tmpl.lifted, np.vstack([noise[:80], tmpl.lifted, noise[80:]]))
+    ref = (tmpl.frames, log_power(tmpl.total))
+    same = average(ref, [ref, ref])
+    slow = np.repeat(np.arange(len(tmpl.frames)), [2 if i % 4 == 0 else 1 for i in range(len(tmpl.frames))])
+    stretched = average(ref, [ref, (ref[0][slow], ref[1][slow])])
+    drift = np.abs(same[0] - tmpl.frames).max()
+    kept = (stretched[0] * tmpl.frames).sum(1)[shaped].mean()
+    print("located at hops %d-%d (expected 80-%d), cost over shaped frames %.1e; averaged with itself: "
+          "max change %.1e; with a slower copy: mean frame similarity %.5f" % (
+              begin, end, 80 + len(tmpl.lifted) - 1, cost - (~shaped).mean(), drift, kept))
+    if (begin, end) != (80, 80 + len(tmpl.lifted) - 1) or cost - (~shaped).mean() > 1e-9 \
+            or drift > 1e-9 or kept < 0.999:
+        sys.exit("alignment or averaging is broken")
     print("OK")
 
 
@@ -579,8 +933,14 @@ def main():
     ap.add_argument("--config", default="amd.conf",
                     help="amd.conf whose [general] and [signature] to replay (default amd.conf); "
                          "the templates key is ignored, give --templates instead")
-    ap.add_argument("--thresholds", help="thresholds to evaluate (default: the configured one "
-                                         "and two either side)")
+    ap.add_argument("--thresholds", help="thresholds to evaluate, decimals allowed (default: the "
+                                         "configured one and two points either side)")
+    ap.add_argument("--alignment", choices=("rigid", "local"), default="rigid",
+                    help="rigid, as AMD() matches, or local: open-begin warped alignment "
+                         "over liftered frames (default rigid)")
+    ap.add_argument("--average", action="store_true",
+                    help="replace each of --templates by the average of its voice's positive "
+                         "calls, evaluated leave-one-out")
     ap.add_argument("--positive-label", default="SCREENED",
                     help="sidecar label marking a screened call (default SCREENED)")
     ap.add_argument("--self-test", action="store_true",
@@ -592,12 +952,15 @@ def main():
         return
     if not args.corpus:
         ap.error("give --corpus, or --self-test")
+    if args.average and not args.templates:
+        ap.error("--average needs --templates, one per voice")
 
     cfg = amd_replay.read_config(args.config)
     sig = read_signature_config(args.config)
     report_at = sig["threshold"]
-    thresholds = sorted({int(t) for t in args.thresholds.split(",")} | {report_at}) \
-        if args.thresholds else [report_at + d for d in (-2, -1, 0, 1, 2) if 0 <= report_at + d <= 100]
+    steps = (-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2) if args.alignment == "local" else (-2, -1, 0, 1, 2)
+    thresholds = sorted({float(t) for t in args.thresholds.split(",")} | {report_at}) \
+        if args.thresholds else [report_at + d for d in steps if 0 <= report_at + d <= 100]
     print("config: %s%s" % (args.config, "" if os.path.exists(args.config) else " (not found, defaults)"))
     print("signature: %s" % " ".join("%s=%d" % kv for kv in sig.items()))
 
@@ -606,14 +969,19 @@ def main():
         sys.exit("no <call>.wav / <call>.json pairs under %s" % args.corpus)
     for c in calls:
         c["path"] = os.path.join(args.corpus, c["name"] + ".wav")
-    print("corpus: %d calls   %s\n" % (len(calls), dict(collections.Counter(c["label"] for c in calls))))
+    print("corpus: %d calls   %s" % (len(calls), dict(collections.Counter(c["label"] for c in calls))))
+    print("alignment: %s%s\n" % (args.alignment, " (theta %.2f, penalty %.2f)" % (THETA, WARP_PENALTY)
+                                 if args.alignment == "local" else ""))
 
     if args.templates:
         templates = [Template(os.path.basename(p)[:-4] if p.endswith(".wav") else os.path.basename(p),
                               read_wav(p), sig) for p in args.templates]
-        cmd_templates(templates, calls, thresholds, report_at, args.positive_label)
+        if args.average:
+            cmd_average(templates, calls, sig, thresholds, report_at, args.positive_label, args.alignment)
+        else:
+            cmd_templates(templates, calls, thresholds, report_at, args.positive_label, args.alignment)
     else:
-        cmd_select(calls, sig, thresholds, report_at, args.positive_label)
+        cmd_select(calls, sig, thresholds, report_at, args.positive_label, args.alignment)
 
 
 if __name__ == "__main__":
