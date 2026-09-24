@@ -32,7 +32,7 @@ struct ast_frame;
 struct amd_signature;
 
 /*!
- * \brief Set up the filterbank, the template cache and the CLI commands.
+ * \brief Set up the filterbank, the reference caches and the CLI commands.
  *
  * \retval 0 on success, -1 on failure
  */
@@ -44,19 +44,28 @@ void amd_signature_cleanup(void);
 /*!
  * \brief Take the defaults from the [signature] section of amd.conf.
  *
- * Without the section, or without templates in it, amd_signature_start() does
- * not start a matcher. Cached templates are dropped, so that re-recorded
- * references are picked up.
+ * Without the section, or unless it sets enabled, amd_signature_start() does
+ * not start a matcher. The reference caches are dropped.
  */
 void amd_signature_load_config(struct ast_config *cfg);
 
 /*!
- * \brief Start matching a call against the configured templates.
+ * \brief Drop the reference caches, so that the next call rescans the
+ * reference directories.
  *
- * Templates are resolved in the channel language.
+ * To be called on every reload, whether or not amd.conf changed: references
+ * are files of their own, added and removed without touching amd.conf.
+ */
+void amd_signature_flush(void);
+
+/*!
+ * \brief Start matching a call against the references of its language.
+ *
+ * These are the .sig files in the amd/<language>/ directory under the
+ * configuration directory, the language being the channel's.
  *
  * \retval a matcher, to be released with amd_signature_free()
- * \retval NULL if no templates are configured, or none could be loaded
+ * \retval NULL if matching is not enabled, or the language has no references
  */
 struct amd_signature *amd_signature_start(struct ast_channel *chan);
 
@@ -69,11 +78,11 @@ struct amd_signature *amd_signature_start(struct ast_channel *chan);
  */
 int amd_signature_feed(struct amd_signature *s, struct ast_frame *f);
 
-/*! \brief The name of the template which matched, or "" if none has. */
+/*! \brief The name of the reference which matched, or "" if none has. */
 const char *amd_signature_name(struct amd_signature *s);
 
 /*! \brief The highest similarity seen so far, from 0 to 100. */
-int amd_signature_score(struct amd_signature *s);
+float amd_signature_score(struct amd_signature *s);
 
 /*! \brief Release a matcher. NULL is allowed. */
 void amd_signature_free(struct amd_signature *s);

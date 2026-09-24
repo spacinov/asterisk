@@ -1,0 +1,362 @@
+                   AMD() signature matching: how it works, how to run it
+
+This document is for whoever needs to understand how AMD() recognises call
+screening prompts, or to make, check and deploy the reference files it
+matches against. Section 0 is the minimum setup, section 1 explains the
+matcher, section 2 the reference files, sections 3 and 4 the tooling and
+the day to day tasks, and section 5 deployment.
+
+The code is apps/amd/signature.c. The tooling is
+contrib/scripts/amd_signature_sweep.py, with contrib/scripts/amd_replay.py
+for AMD()'s own settings.
+
+
+0. Quick start
+
+Given a set of .sig files for a language, the minimum setup is:
+
+  1. Drop the files in /etc/asterisk/amd/<language>/, e.g.
+     /etc/asterisk/amd/fr/ios-screening-1.sig and so on.
+  2. Enable matching in amd.conf; the other keys have working defaults:
+
+         [signature]
+         enabled = yes
+
+  3. Make sure the dialplan sets the channel language before AMD(), e.g.
+     Set(CHANNEL(language)=fr).
+  4. Run "module reload app_amd", and check the files are listed by
+     "amd signature show templates".
+
+Screened calls then come back with AMDSTATUS=SCREENED. Sections 3 and 4
+explain how to make and check the .sig files.
+
+
+1. What the matcher does
+
+1.1 The problem
+
+Some call screening services answer a call themselves and play a recorded
+prompt before connecting a human; recent iOS versions do this. On energy and
+timing, which is all AMD() looks at, the prompt is an answering machine
+greeting, so AMD() returns MACHINE and the dialplan hangs up on a person who
+was about to answer.
+
+The prompt is however always the same words, spoken by one of a handful of
+synthetic voices. With [signature] enabled in amd.conf, AMD() compares the
+audio with a reference of each voice as it arrives, and returns
+
+    AMDSTATUS=SCREENED
+    AMDCAUSE=SIGNATURE-<reference>-<score>, e.g. SIGNATURE-ios-screening-2-96.3
+
+as soon as one matches. The match typically comes several hundred
+milliseconds before AMD() would reach MACHINE, while the prompt is still
+playing, which leaves the dialplan time to react.
+
+1.2 How a call is compared with a reference
+
+Front end. The audio runs through 12 bandpass filters from 200 to 3500 Hz.
+Every 10 ms (a "hop") the band powers become a spectral shape: logarithms,
+smoothed over three hops, with the mean removed and scaled to unit length.
+The shape ignores loudness, so a quiet call matches a loud reference.
+
+Envelope. The shape is then reduced to its first six cepstral coefficients.
+This keeps the spectral envelope, which carries the words, and discards the
+harmonics of the voice, which move with its pitch. A rendition with a
+different intonation therefore still looks the same.
+
+Reference. A reference is the first 3 seconds of the prompt, as the same
+frames. Frames much quieter than their surroundings (pauses, breaths) are
+marked inactive and ignored, since they have no reliable shape.
+
+Alignment. Each reference is aligned with the call by dynamic time warping:
+the call is allowed to run faster or slower than the reference (from half to
+twice its speed), at a small cost each time it does. The alignment can start
+anywhere in the call and anywhere in the reference, so a call answered late
+still matches the part of the prompt it heard.
+
+Score. The score of an alignment is the average similarity, as a percentage,
+between the reference frames it covers and the call frames they are aligned
+with. An alignment only counts once it covers at least 1.2 seconds of the
+reference (match_window), at least half of it active; shorter ones are too
+easily matched by chance. At every hop, each reference reports the score of
+its best alignment so far.
+
+Decision. A reference matches when its score reaches the threshold (95) on
+two consecutive hops, provided the last 1.2 seconds of audio are loud enough
+(silence_threshold): a silent line has a shape too, and must not match. All
+references are scored at every hop, and the first one to match gives its
+name to AMDCAUSE.
+
+1.3 Why it is built this way
+
+  - One reference per voice. A handset plays the prompt in the voice it is
+    set to, and the voices differ too much for one reference to cover them.
+  - Averaged references. A single recording of a voice only approximately
+    matches other calls in that voice. The reference is instead the average
+    of every screened call heard in that voice, which matches all of them
+    well and keeps a clear gap between screened calls and the rest.
+  - Alignment rather than a straight comparison. Two renditions of the same
+    voice differ in pace and pauses; aligning them absorbs that.
+  - Early verdict. A longer match_window gives a slightly clearer separation,
+    but a later verdict, and a match that comes after AMD() has decided is of
+    no use. 1.2 seconds is the balance point.
+
+1.4 Configuration and commands
+
+In amd.conf:
+
+    [signature]
+    enabled = yes            ; default no: AMD() runs as it always has
+    threshold = 95           ; 0 to 100, decimals allowed
+    template_length = 3000   ; ms of each reference used
+    match_window = 1200      ; ms of reference a match must cover
+    silence_threshold = 256  ; minimum mean level over the last match_window
+
+The references are the .sig files of the amd/<language>/ directory under the
+configuration directory, e.g. /etc/asterisk/amd/fr/, for the channel
+language. The dialplan must therefore set CHANNEL(language) before AMD(). A
+language with a dialect such as fr_CA falls back to fr, and to nothing else;
+a call in a language without references runs plain AMD(), with a warning in
+the log once per language. At most 16 files are used per language, in name
+order.
+
+At the Asterisk CLI:
+
+    amd signature show templates
+        the references each language will use, with their seed and the
+        number of recordings they were averaged from
+
+    amd signature test <reference> <recording> [<recording>...]
+        scores sound files against one reference, e.g.
+        "amd signature test fr/ios-screening-2 recordings/call1"; the
+        reference is looked up under the amd directory, the recordings like
+        any sound file
+
+    module reload app_amd
+        rescans the reference directories; needed after adding, replacing or
+        removing a .sig file
+
+
+2. The reference files
+
+One .sig file per voice, named after the recording the voice's average
+started from (its "seed"), e.g. ios-screening-2.sig. The name appears in
+AMDCAUSE, and stays the same each time the reference is refreshed.
+
+A .sig is text. A header of "key: value" lines (';' starts a comment):
+
+    format: amd-signature 1
+    frontend: bands=12 hop=10 q=2.5 low=200 high=3500 floor=0.10 smooth=3
+    seed: ios-screening-2        the seed recording
+    calls: 20                    how many corpus calls were averaged in
+    sources: 21                  then one line per recording averaged:
+    source: hand ios-screening-2   the seed ("hand"), or
+    source: call 0afd626b-...      a corpus call ("call"), by file name
+    built: 2026-09-24
+    frames: 300
+
+followed by one line per 10 ms of prompt: the logarithm of its power, then
+the 12 values of its spectral shape. A file is about 34 KB. Asterisk refuses
+a file whose frontend line differs from its own, since the frames would not
+be comparable.
+
+The files, the seed recordings and the corpus they are made from do not go
+into git.
+
+
+3. Getting started with the tooling
+
+3.1 Requirements
+
+Python 3 and numpy, e.g. in a virtual environment:
+
+    python3 -m venv ~/amd-venv
+    ~/amd-venv/bin/pip install numpy
+    ~/amd-venv/bin/python contrib/scripts/amd_signature_sweep.py --self-test
+
+--self-test takes a second and must end with "OK": it checks that the script
+still computes exactly what the module computes. Run it after pulling
+changes to either.
+
+Both scripts read an amd.conf (--config, default ./amd.conf) for AMD()'s
+[general] settings and the [signature] tuning keys. Point them at a copy of
+the server's amd.conf, so that the replay matches what the server does. Keys
+missing from the file take their defaults.
+
+3.2 The corpus
+
+A corpus is a directory of labelled recordings of real calls, as AMD() heard
+them, one pair of files per call:
+
+    corpus/
+        0afd626b-5417-4243-a2e7-ba2b2759ad50.wav
+        0afd626b-5417-4243-a2e7-ba2b2759ad50.json
+        ...
+
+  - The .wav is the start of the call from the moment it was answered, at
+    least the first 5 seconds, 8 kHz mono 16-bit. Other formats can be
+    converted with sox: "sox in.wav -r 8000 -c 1 -b 16 out.wav".
+  - The .json holds at least a "label": SCREENED for a screening prompt,
+    MACHINE for a voicemail, HUMAN for a person, or anything else (e.g.
+    BLOCKED) for calls that are none of these. Only SCREENED matters to the
+    signature tooling; everything else counts as "not screened".
+
+      {"label": "SCREENED"}
+
+The more screened calls per voice, the better the averages; the more other
+calls, the more trustworthy the false positive figures. Sidecars may carry
+other fields, phone numbers included: keep the corpus out of git and out of
+anything shared.
+
+3.3 Seed recordings
+
+Each voice needs one seed recording: the prompt alone, trimmed to start just
+before the first word ("Bonjour") and end just after the last.
+
+  - Best: capture it by hand, by calling a handset with screening enabled and
+    set to that voice, and recording the call.
+  - Otherwise: cut it out of a screened call of the corpus, e.g.
+    "sox corpus/<call>.wav seed-5.wav trim 0.26 =6.88". The tooling notices
+    that this seed is part of that call and never scores it on it.
+
+Name seeds after what they are, e.g. ios-screening-1.wav for voice 1: the name
+becomes the .sig file's name and appears in AMDCAUSE. A seed that is
+re-recorded should get a new name.
+
+
+4. Day to day tasks
+
+All commands are run from the top of the source tree; add --config if the
+amd.conf copy is not ./amd.conf.
+
+4.1 Make or refresh the references
+
+    python3 contrib/scripts/amd_signature_sweep.py --corpus corpus \
+        --templates ios-screening-1.wav ios-screening-2.wav ... \
+        --average --write-averages signatures/fr
+
+Give every seed, one per voice. This takes a minute or two for a thousand
+calls. The script assigns each screened call to the seed it resembles most,
+averages each voice, writes signatures/fr/<seed>.sig for every voice, and
+prints a report (4.4) on how well the averages would do.
+
+The figures in that report are for calls the references have not heard: each
+screened call is scored by an average built without it. They are what new
+calls can expect.
+
+Files in signatures/fr that this run did not write are listed as "not
+refreshed"; delete them if their voice is retired.
+
+4.2 Check the deployed references on new calls
+
+Once new calls have been labelled into the corpus:
+
+    python3 contrib/scripts/amd_signature_sweep.py --corpus corpus \
+        --templates signatures/fr/*.sig
+
+A reference is not scored on the calls it was averaged from, so the figures
+only cover calls it has not heard. Screened calls that start being missed
+mean the prompt or its voices have changed, which otherwise only shows as
+screened calls coming back MACHINE. Refresh the references (4.1).
+
+4.3 Try recordings as references
+
+    python3 contrib/scripts/amd_signature_sweep.py --corpus corpus \
+        --templates candidate-1.wav candidate-2.wav
+
+evaluates recordings as they are, without averaging: useful to check that a
+new seed catches the calls it is meant to before averaging with it. Without
+--templates at all, the script tries every screened call of the corpus as a
+reference and picks the fewest that cover them all; this is a way to find
+voices in a corpus nobody has sorted.
+
+4.4 Read the report
+
+    signature: threshold=95 template_length=3000 match_window=1200 ...
+    corpus: 793 calls   {'MACHINE': 600, 'HUMAN': 154, 'SCREENED': 36, ...}
+
+    averaging 36 positive calls onto 5 references:
+      ios-screening-1                  9 calls
+      ...
+
+How many screened calls went to each seed. A seed with no calls is written
+as it is, from the seed alone.
+
+      thresh    detected  false positives  latency / lead over AMD, ms
+          95    36/36     0/757            median 1480, p90 1700;
+                                           lead median 800, min 680
+          ...
+
+For each threshold: the screened calls detected, the other calls wrongly
+detected, when the match came, and how long before AMD()'s own verdict. The
+lead must be positive: a match after AMD() has decided never reaches the
+dialplan.
+
+    margin +4.5: weakest SCREENED call scores 97.7, strongest other call 93.2
+
+The gap between the worst screened call and the best of the rest. A healthy
+set has a positive margin of a few points; set the threshold about halfway
+between the two scores.
+
+    === at threshold 95: label (row) against AMD() verdict (column) ===
+
+What AMD() as a whole would return for each label, with the references at
+the configured threshold.
+
+    templates, by the SCREENED calls each matches first / at all:
+    missed SCREENED calls (best loud score, AMD verdict):
+    smallest leads over AMD's own verdict (ms):
+    highest loud scores among the other calls (check these for mislabels):
+
+The last sections are the calls worth listening to. A missed screened call
+may be a voice with no seed (4.5). A high scoring call that is not labelled
+SCREENED may be mislabelled.
+
+4.5 Add a voice, or react to a changed prompt
+
+Screened calls missed by every reference, or a seed collecting calls it
+barely matches, mean a voice the set does not know, or a prompt that has
+changed. Take one such call, cut its prompt as a new seed (3.3), check it
+with 4.3, and rerun 4.1 with it added.
+
+4.6 Tune AMD()'s own settings
+
+amd_replay.py replays AMD()'s [general] settings over the same corpus:
+
+    python3 contrib/scripts/amd_replay.py --corpus corpus
+    python3 contrib/scripts/amd_replay.py --corpus corpus --sweep
+    python3 contrib/scripts/amd_replay.py --call corpus/<call>.wav
+
+The first reports how AMD() classifies the corpus, the second searches for
+better settings, and the third traces one call.
+
+
+5. Deploying
+
+  1. Copy the new and refreshed .sig files to /etc/asterisk/amd/<language>/
+     on the server, and delete those of retired voices.
+  2. Run "module reload app_amd".
+  3. Check with "amd signature show templates".
+
+amd.conf only changes to set enabled or to change the threshold.
+
+To match another language's prompts on the calls of a language, for handsets
+set to a language other than the one dialled, link or copy that language's
+files into its directory.
+
+
+6. Things that go wrong
+
+  - Screened calls come back MACHINE on every call: the channel language is
+    not set, or not the one the files are under. Look for "no references for
+    language" in the log, and check "amd signature show templates".
+  - A .sig is refused at load: it was made for another front end (see the log
+    message). Remake it with the current script.
+  - Figures that look too good: a reference must never be judged on a call it
+    was made from. The script excludes those calls itself; do not work
+    around it by, say, copying a call under another name.
+  - Every .sig file in the directory is used, including leftovers. Keep only
+    the files meant to be live.
+  - The script and the module share their settings (front end, envelope,
+    alignment). If one changes, the other must too: run --self-test, and
+    remake the references.
