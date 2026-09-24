@@ -111,13 +111,15 @@
 			<para>When loaded, AMD reads amd.conf and uses the parameters specified as
 			default values. Those default values get overwritten when the calling AMD
 			with parameters.</para>
-			<para>If the <literal>[signature]</literal> section of amd.conf names reference
-			recordings in <literal>templates</literal>, AMD also compares the audio against
-			them and returns <literal>SCREENED</literal> as soon as one matches. This is meant
+			<para>If the <literal>[signature]</literal> section of amd.conf sets
+			<literal>enabled</literal>, AMD also compares the audio against references of known
+			prompts and returns <literal>SCREENED</literal> as soon as one matches. This is meant
 			for call screening services, such as the one recent iOS versions offer, which answer
 			with a fixed recorded prompt that AMD would otherwise classify as a MACHINE. The
-			recordings are resolved in the channel language, like any other sound file. Without
-			the section, AMD behaves exactly as it always has.</para>
+			references are the <literal>.sig</literal> files in the
+			<literal>amd/</literal><replaceable>language</replaceable> directory under the
+			configuration directory, for the channel language. Without the section, AMD behaves
+			exactly as it always has.</para>
 			<para>This application sets the following channel variables:</para>
 			<variablelist>
 				<variable name="AMDSTATUS">
@@ -149,8 +151,8 @@
 						Word Count - maximum number of words.
 					</value>
 					<value name="SIGNATURE">
-						Template - Score: the reference recording which matched, and the
-						similarity it reached, from 0 to 100.
+						Template - Score: the reference which matched, named after its file,
+						and the similarity it reached, from 0 to 100 to one decimal.
 					</value>
 				</variable>
 			</variablelist>
@@ -387,11 +389,11 @@ static void isAnsweringMachine(struct ast_channel *chan, const char *data)
 
 			/* A recognised prompt is conclusive, and has to beat MACHINE on the same frame */
 			if (amd_signature_feed(signature, f)) {
-				ast_verb(3, "AMD: Channel [%s]. SCREENED: signature [%s] score [%d]\n",
+				ast_verb(3, "AMD: Channel [%s]. SCREENED: signature [%s] score [%.1f]\n",
 					ast_channel_name(chan), amd_signature_name(signature), amd_signature_score(signature));
 				ast_frfree(f);
 				strcpy(amdStatus , "SCREENED");
-				snprintf(amdCause, sizeof(amdCause), "SIGNATURE-%s-%d",
+				snprintf(amdCause, sizeof(amdCause), "SIGNATURE-%s-%.1f",
 					amd_signature_name(signature), amd_signature_score(signature));
 				break;
 			}
@@ -651,6 +653,8 @@ static int load_module(void)
 
 static int reload(void)
 {
+	/* Signature references are files of their own, which change without amd.conf changing. */
+	amd_signature_flush();
 	if (load_config(1))
 		return AST_MODULE_LOAD_DECLINE;
 	return AST_MODULE_LOAD_SUCCESS;
