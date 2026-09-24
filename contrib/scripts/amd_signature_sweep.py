@@ -1,70 +1,62 @@
 #!/usr/bin/env python3
-"""Evaluate and choose AMD() signature templates against labelled calls.
+"""Make, evaluate and choose AMD() signature references against labelled calls.
 
 Replays each call the way apps/app_amd.c runs it: the signature matcher of
 apps/amd/signature.c and AMD's own state machine, taken from amd_replay.py, see
 the same 20ms frames, and the matcher goes first on each frame. A call is
-therefore SCREENED only if a template matches before AMD reaches a verdict of
+therefore SCREENED only if a reference matches before AMD reaches a verdict of
 its own, and the detections, false positives and lead over AMD's verdict are
 what AMD() would report on the same audio.
 
-The matcher is mirrored in full: onset, template length, a match window tried
-at every offset step within the template, the per window energy gate, the
-silence threshold over the window being scored, rounding of the score to a
-percentage, and the two consecutive hops a match must hold for.
+The matcher is mirrored in full: onset, template length, the lifter, the
+activity gate, the open-begin alignment and its scores, the silence threshold
+over the last match window, and the two consecutive hops a match must hold
+for. doc/amd-signature.txt describes the matcher and why it is built that way.
 
 Apple changes these prompts, and a stale reference set fails silently as a
 MACHINE verdict, so this is worth re-running as calls are labelled.
 
 The filterbank here is an FFT convolution with each biquad's impulse response,
 which is far faster over hundreds of files than the sample-by-sample recursion
-in apps/amd/signature.c but numerically identical to it, and the scorer is a
-matrix form of the per hop loop. --self-test asserts both, so this script
-cannot silently drift from the module.
+in apps/amd/signature.c but numerically identical to it, and the scorer
+computes a whole column of the alignment for every call at once rather than
+cell by cell. --self-test asserts both, so this script cannot silently drift
+from the module.
 
 A reference cut from a call of the corpus matches that call perfectly, which
 says nothing about the calls it has not heard. Such a reference is recognised,
-the whole of it reappearing in the recording, and not scored on that call.
+the whole of it reappearing in the recording, and not scored on that call; a
+.sig reference is not scored on the calls it was averaged from.
 
-Two matchers the module does not have yet can be evaluated before they are
-written in C:
-
---alignment local replaces the fixed windows with a single open-begin
-alignment over the whole reference, which tolerates the tempo of another
-rendition: dynamic time warping with local slopes of 0.5 to 2, a penalty on
-every step off the diagonal, and a path allowed to start anywhere in the
-reference and in the call. A path scores the mean similarity over the
-reference frames it covers, and counts once it spans a match window. Frames
-are liftered to their first six cepstral coefficients, which keeps the
-spectral envelope and drops the pitch harmonics a narrow band resolves, so
-that another voice's intonation does not cost similarity. Scores are no longer
-whole percentages, and the thresholds may be given in tenths.
-
---average replaces each reference by the average of every screened call of
-its voice. Each such call is assigned the reference it aligns with best, and
-its prompt is cut out and averaged with the reference by DTW barycenter
-averaging. A screened call is only scored by an average built without it, so
-the figures are those of calls the set has not heard. An averaged reference
-exists only as features: AMD() cannot load it.
+--average replaces each reference, the seed of a voice, by the average of
+every screened call of that voice. Each such call is assigned the seed it
+aligns with best, and its prompt is cut out and averaged with the seed by DTW
+barycenter averaging. A screened call is only scored by an average built
+without it, so the figures are those of calls the set has not heard.
+--write-averages then writes each voice's average, built from every call, as
+the <seed>.sig file AMD() loads from /etc/asterisk/amd/<language>/.
 
 A corpus is a directory of <call>.wav, 8 kHz mono 16-bit, each with a
 <call>.json sidecar carrying a "label". Requires numpy.
 
 Usage:
-  amd_signature_sweep.py --corpus DIR --templates ref1.wav ref2.wav ...
+  amd_signature_sweep.py --corpus DIR --templates ref1.wav ref2.sig ...
   amd_signature_sweep.py --corpus DIR               # choose a set from the corpus
   amd_signature_sweep.py --corpus DIR --config amd.conf --thresholds 94,95,96
-  amd_signature_sweep.py --corpus DIR --templates ... --alignment local --average
+  amd_signature_sweep.py --corpus DIR --templates seed1.wav ... --average --write-averages OUT
   amd_signature_sweep.py --self-test
 """
 
 import argparse
 import collections
 import copy
+import datetime
 import glob
 import json
 import os
+import shutil
 import sys
+import tempfile
 import wave
 
 import numpy as np
@@ -92,7 +84,6 @@ SIG_DEFAULTS = {
     "threshold": 95,
     "template_length": 3000,
     "match_window": 1200,
-    "offset_step": 100,
     "silence_threshold": 256,
 }
 
@@ -103,14 +94,21 @@ HOPS_PER_FRAME = amd_replay.FRAME_MS // HOP_MS
 # from the recording itself. The same rendition from another call stays under 0.98.
 SELF_CUT = 0.995
 
-# --alignment local: the similarity a step must beat to extend a path, and the
-# cost of a step off the diagonal, per active reference frame.
+# Must track SIG_THETA, SIG_WARP_PENALTY and SIG_NCEPS in apps/amd/signature.c:
+# the similarity a step must beat to extend a path, the cost of a step off the
+# diagonal per active reference frame, and the cepstral coefficients the
+# lifter keeps, c0 being zero after mean removal. A path counts once it spans
+# a match window, at least half of it active.
 THETA = 0.90
 WARP_PENALTY = 0.20
-# Cepstral coefficients kept by the lifter, c0 being zero after mean removal.
 NCEPS = 6
 LIFTER = np.cos(np.pi * np.arange(1, NCEPS + 1)[:, None] * (np.arange(NBANDS) + 0.5) / NBANDS)
 DBA_ITERATIONS = 10
+
+# The .sig format, as sig_load_sig() in apps/amd/signature.c reads it.
+SIG_FORMAT = "amd-signature 1"
+SIG_FRONTEND = "bands=%d hop=%d q=%g low=%g high=%g floor=%.2f smooth=%d" % (
+    NBANDS, HOP_MS, Q, FREQ_LOW, FREQ_HIGH, FLOOR_REL, SMOOTH)
 
 
 def biquads():
@@ -212,7 +210,7 @@ def log_power(total):
 
 
 class Template:
-    """A reference cut into windows, as sig_template_build() does it."""
+    """A reference, as sig_template_from_frames() builds it."""
 
     def __init__(self, name, x, sig):
         v, total, _ = features(x)
@@ -228,23 +226,17 @@ class Template:
 
     def _build(self, name, v, total, sig):
         self.name = name
+        self.sources = []                   # corpus calls a .sig was averaged from
         self.onset = int(np.argmax(total >= total.max() * ONSET))
         self.win = sig["match_window"] // HOP_MS
-        step = max(1, sig["offset_step"] // HOP_MS)
         length = min(sig["template_length"] // HOP_MS, len(v) - self.onset)
         if length < self.win:
             raise ValueError("%s: %dms of audio after silence, need %dms"
                              % (name, length * HOP_MS, sig["match_window"]))
         self.frames = v[self.onset: self.onset + length]
         energy = total[self.onset: self.onset + length]
-        self.windows = []                   # (offset, gated frames, active count)
-        for base in range(0, length - self.win + 1, step):
-            seg = energy[base: base + self.win]
-            act = seg >= seg.max() * GATE
-            if act.any():
-                self.windows.append((base, act, int(act.sum())))
-        # For --alignment local and --average: the same gate against the
-        # loudest frame within half a window either side.
+        # Frames more than 25dB below the loudest within half a window either
+        # side carry no reliable shape, and are not scored.
         self.total = energy
         self.lifted = lift(self.frames)
         h = self.win // 2
@@ -252,36 +244,80 @@ class Template:
                              for i in range(length)], dtype=float)
 
 
-def to_percent(s):
-    """(int) (100.0f * sum / active + 0.5f), clamped to 0..100."""
-    return np.clip(np.trunc(100.0 * s + 0.5), 0, 100).astype(int)
+def write_sig(path, v, total, seed, calls, sources):
+    """Write a reference as the .sig file sig_load_sig() reads.
 
-
-def score_hops(tmpl, v):
-    """The score sig_detector_frame() computes for this template at each hop.
-
-    Entry s is the hop at which the ring holds frames s .. s + win - 1, so the
-    hop count is s + win. The best window wins. The sum over a window of
-    dot(call frame s + k, template frame offset + k) is a diagonal of the
-    matrix of every call frame against every template frame, read through a
-    strided view rather than recomputed per offset.
+    sources are (kind, name) pairs, kind "hand" for a recording and "call" for
+    a corpus call: names of files only, never anything from a sidecar.
     """
-    win = tmpl.win
-    n = len(v) - win + 1
-    if n <= 0:
-        return np.zeros(0, dtype=int)
-    g = np.ascontiguousarray(v @ tmpl.frames.T)
-    s0, s1 = g.strides
-    best = np.full(n, -1.0)
-    for base, act, count in tmpl.windows:
-        diag = np.lib.stride_tricks.as_strided(g[:, base:], shape=(n, win), strides=(s0, s0 + s1))
-        best = np.maximum(best, diag @ act / count)
-    return to_percent(best)
+    with open(path, "w") as fh:
+        fh.write("; AMD() signature reference, made by amd_signature_sweep.py\n")
+        fh.write("format: %s\n" % SIG_FORMAT)
+        fh.write("frontend: %s\n" % SIG_FRONTEND)
+        fh.write("seed: %s\n" % seed)
+        fh.write("calls: %d\n" % calls)
+        fh.write("sources: %d\n" % len(sources))
+        for kind, name in sources:
+            fh.write("source: %s %s\n" % (kind, name))
+        fh.write("built: %s\n" % datetime.date.today().isoformat())
+        fh.write("frames: %d\n" % len(v))
+        for lp, row in zip(log_power(total), v):
+            fh.write(" ".join("%.5g" % x for x in (lp, *row)) + "\n")
+
+
+def read_sig(path):
+    """(v, total, header) from a .sig file, rejecting one made for another front end."""
+    header, rows = {"source": []}, []
+    for lineno, line in enumerate(open(path), 1):
+        line = line.split(";")[0].strip()
+        if not line:
+            continue
+        if ":" in line:
+            key, value = (s.strip() for s in line.split(":", 1))
+            if key == "source":
+                header["source"].append(tuple(value.split(None, 1)))
+            else:
+                header[key] = value
+            continue
+        try:
+            row = [float(x) for x in line.split()]
+        except ValueError:
+            raise ValueError("%s:%d: not a frame" % (path, lineno))
+        if len(row) != NBANDS + 1:
+            raise ValueError("%s:%d: %d values, need %d" % (path, lineno, len(row), NBANDS + 1))
+        rows.append(row)
+    if header.get("format") != SIG_FORMAT:
+        raise ValueError("%s: format '%s', need '%s'" % (path, header.get("format"), SIG_FORMAT))
+    if header.get("frontend") != SIG_FRONTEND:
+        raise ValueError("%s: made for front end '%s', this one is '%s'"
+                         % (path, header.get("frontend"), SIG_FRONTEND))
+    if not rows or ("frames" in header and int(header["frames"]) != len(rows)):
+        raise ValueError("%s: %d frames, header says %s" % (path, len(rows), header.get("frames")))
+    rows = np.array(rows)
+    # The shapes were written to five digits: make them unit length again, as
+    # the module does.
+    return unit(rows[:, 1:]), np.exp(rows[:, 0]), header
+
+
+def load_template(path, sig):
+    """A reference from a recording or a .sig file."""
+    name = os.path.splitext(os.path.basename(path))[0]
+    if path.endswith(".sig"):
+        v, total, header = read_sig(path)
+        tmpl = Template.from_features(name, v, total, sig)
+        tmpl.sources = [n for kind, n in header["source"] if kind == "call"]
+        return tmpl
+    return Template(name, read_wav(path), sig)
 
 
 def score_local(tmpl, frames, theta=THETA, penalty=WARP_PENALTY):
-    """--alignment local: the score at each hop of each call in frames, indexed
-    as score_hops() indexes it.
+    """The score sig_detector_frame() computes for this reference at each hop
+    of each call in frames.
+
+    Entry s is the hop at which the last match window of the call holds hops
+    s .. s + win - 1, so the hop count is s + win: nothing is scored before a
+    window of audio has been heard, although the alignment runs from the
+    first hop.
 
     A local alignment on similarity: stepping onto reference frame i at call
     hop j gains act_i * (t_i . v_j - theta), less penalty * act_i for a step
@@ -290,7 +326,10 @@ def score_local(tmpl, frames, theta=THETA, penalty=WARP_PENALTY):
     covers two reference frames in one hop. Each cell carries where its path
     started in the reference and the active frames it covered, A, so its
     score theta + H / A is the mean similarity over them less the penalties.
-    A hop scores the best path spanning at least a match window.
+    A hop scores the best path spanning at least a match window of which at
+    least half is active: without the second condition, a reference which is
+    mostly pauses matches the noise floor of any call on the few frames it
+    has.
 
     Every way into a cell comes from an earlier hop, so a whole column is
     computed at once, for all calls together. Calls are taken longest first so
@@ -325,8 +364,8 @@ def score_local(tmpl, frames, theta=THETA, penalty=WARP_PENALTY):
             S[:, i0:] = np.where(better, s, S[:, i0:])
         H += g
         A += act
-        spans = (idx - S + 1 >= span) & (A > 0)
-        out[:m, j] = np.where(spans, 100.0 * (theta + H / np.where(A > 0, A, 1)), 0).max(1)
+        spans = (idx - S + 1 >= span) & (A >= 0.5 * span)
+        out[:m, j] = np.where(spans, 100.0 * (theta + H / np.maximum(A, 1)), 0).max(1)
         H2[:m], A2[:m], S2[:m] = H1[:m], A1[:m], S1[:m]
         H1[:m], A1[:m], S1[:m] = H, A, S
     scores = [None] * len(frames)
@@ -440,7 +479,7 @@ def first_hit(scores, loud, threshold):
 
 
 def read_signature_config(path):
-    """The [signature] keys of an amd.conf, other than templates."""
+    """The [signature] keys of an amd.conf that tune the matcher."""
     sig = dict(SIG_DEFAULTS)
     if not path or not os.path.exists(path):
         return sig
@@ -455,7 +494,7 @@ def read_signature_config(path):
         key, value = (s.strip() for s in line.split("=", 1))
         if key in sig:
             try:
-                sig[key] = int(value)
+                sig[key] = float(value) if key == "threshold" else int(value)
             except ValueError:
                 pass
     return sig
@@ -501,16 +540,12 @@ def load_corpus(dirname, cfg, sig):
     return calls
 
 
-def call_scores(tmpl, calls, alignment):
+def call_scores(tmpl, calls):
     """Per call, the score at each hop, or None for a call too short to score."""
     live = [k for k, c in enumerate(calls) if c["features"] is not None]
     out = [None] * len(calls)
-    if alignment == "local":
-        for k, s in zip(live, score_local(tmpl, [lift(calls[k]["features"]) for k in live])):
-            out[k] = s
-    else:
-        for k in live:
-            out[k] = score_hops(tmpl, calls[k]["features"])
+    for k, s in zip(live, score_local(tmpl, [lift(calls[k]["features"]) for k in live])):
+        out[k] = s
     return out
 
 
@@ -544,7 +579,7 @@ def self_cuts(templates, calls, positive):
     return found
 
 
-def hit_matrix(templates, calls, thresholds, alignment="rigid", mask=None):
+def hit_matrix(templates, calls, thresholds, mask=None):
     """For each threshold, the hop count each template first matches each call at.
 
     np.inf where it never does before AMD's own verdict, or where mask, a
@@ -553,7 +588,7 @@ def hit_matrix(templates, calls, thresholds, alignment="rigid", mask=None):
     out = {t: np.full((len(templates), len(calls)), np.inf) for t in thresholds}
     best = np.zeros((len(templates), len(calls)))
     for i, tmpl in enumerate(templates):
-        per_call = call_scores(tmpl, calls, alignment)
+        per_call = call_scores(tmpl, calls)
         for k, call in enumerate(calls):
             scores = per_call[k]
             if scores is None or not len(scores) or (mask is not None and not mask[i, k]):
@@ -665,7 +700,7 @@ def greedy_cover(detects, members):
     return chosen, covered
 
 
-def cmd_select(calls, sig, thresholds, report_at, positive, alignment):
+def cmd_select(calls, sig, thresholds, report_at, positive):
     """Choose a set from the corpus' own positives, and cross-validate the choice."""
     pos = [k for k, c in enumerate(calls) if c["label"] == positive]
     neg = [k for k, c in enumerate(calls) if c["label"] != positive]
@@ -676,7 +711,7 @@ def cmd_select(calls, sig, thresholds, report_at, positive, alignment):
             owner.append(k)
         except ValueError as exc:
             print("  skipped: %s" % exc)
-    hits, best = hit_matrix(candidates, calls, thresholds, alignment)
+    hits, best = hit_matrix(candidates, calls, thresholds)
     n = len(candidates)
     # detects[i, j]: candidate i catches the positive candidate j was cut from
     col = {k: j for j, k in enumerate(owner)}
@@ -714,22 +749,28 @@ def cmd_select(calls, sig, thresholds, report_at, positive, alignment):
            {t: hits[t][chosen] for t in thresholds}, best[chosen], thresholds, report_at, positive)
 
 
-def cmd_templates(templates, calls, thresholds, report_at, positive, alignment):
-    """Evaluate a reference set, never scoring a reference on its own call."""
+def cmd_templates(templates, calls, thresholds, report_at, positive):
+    """Evaluate a reference set, never scoring a reference on its own calls."""
     mask = np.ones((len(templates), len(calls)), dtype=bool)
     for i, k in self_cuts(templates, calls, positive).items():
         print("%s is cut from %s, so it is not scored on that call" % (templates[i].name, calls[k]["name"]))
         mask[i, k] = False
-    hits, best = hit_matrix(templates, calls, thresholds, alignment, mask)
+    index = {c["name"]: k for k, c in enumerate(calls)}
+    for i, tmpl in enumerate(templates):
+        heard = [index[n] for n in tmpl.sources if n in index]
+        if heard:
+            print("%s is averaged from %d calls of this corpus, so it is not scored on them"
+                  % (tmpl.name, len(heard)))
+            mask[i, heard] = False
+    hits, best = hit_matrix(templates, calls, thresholds, mask)
     report(templates, calls, hits, best, thresholds, report_at, positive)
 
 
-def cmd_average(refs, calls, sig, thresholds, report_at, positive, alignment):
-    """Average each reference with the positive calls of its voice, and
-    evaluate the averages leave-one-out."""
+def cmd_average(refs, calls, sig, thresholds, report_at, positive, write_dir=None):
+    """Average each reference with the positive calls of its voice, evaluate
+    the averages leave-one-out, and write the full averages to write_dir."""
     pos = [k for k, c in enumerate(calls) if c["label"] == positive]
     cut = self_cuts(refs, calls, positive)
-    cut_from = {k: i for i, k in cut.items()}
 
     # Each positive goes to the reference it aligns with best, and the stretch
     # of its recording that reference aligns to is its instance of the prompt.
@@ -786,7 +827,26 @@ def cmd_average(refs, calls, sig, thresholds, report_at, positive, alignment):
         if k in held:
             mask[held[k], k] = True
     print("scoring %d averages (%d leave-one-out)\n" % (len(templates), len(held)))
-    hits, best = hit_matrix(templates, calls, thresholds, alignment, mask)
+    hits, best = hit_matrix(templates, calls, thresholds, mask)
+
+    if write_dir:
+        os.makedirs(write_dir, exist_ok=True)
+        written = set()
+        print("writing to %s:" % write_dir)
+        for i, t in enumerate(full):
+            if t is None:
+                continue
+            members = [k for k in pos if voice.get(k) == i]
+            sources = ([] if i in cut else [("hand", refs[i].name)]) + [("call", calls[k]["name"]) for k in members]
+            path = os.path.join(write_dir, refs[i].name + ".sig")
+            write_sig(path, t.frames, t.total, refs[i].name, len(members), sources)
+            written.add(os.path.basename(path))
+            print("  %-30s average of %d calls%s" % (os.path.basename(path), len(members),
+                                                     "" if i in cut else " and the seed"))
+        stale = sorted(f for f in os.listdir(write_dir) if f.endswith(".sig") and f not in written)
+        for f in stale:
+            print("  %-30s not refreshed by this run: remove it if that voice is retired" % f)
+        print()
 
     # Report one row per voice: the first match among its averages.
     rows = sorted(set(owner))
@@ -828,50 +888,15 @@ def self_test():
     sig = dict(SIG_DEFAULTS)
     tmpl = Template("ref", ref, sig)
     v, _, level = features(call)
-    fast = score_hops(tmpl, v)
     loud = window_levels(level, tmpl.win) >= sig["silence_threshold"]
 
-    # sig_detector_frame(), statement for statement
-    win, direct, hits, matched = tmpl.win, [], 0, None
-    for count in range(1, len(v) + 1):
-        if count < win:
-            continue
-        ring = v[count - win: count]
-        lvl = level[count - win: count].mean()
-        score_best = 0
-        for base, act, active in tmpl.windows:
-            total = 0.0
-            for k in range(win):
-                if act[k]:
-                    total += float(ring[k] @ tmpl.frames[base + k])
-            score_best = max(score_best, int(to_percent(np.array([total / active]))[0]))
-        direct.append(score_best)
-        hit = score_best >= sig["threshold"]
-        if lvl < sig["silence_threshold"]:
-            hits = 0
-            continue
-        if hit:
-            hits += 1
-            if hits >= DEBOUNCE and matched is None:
-                matched = count
-        else:
-            hits = 0
-    delta = np.abs(fast - np.array(direct)).max()
-    first = first_hit(fast, loud, sig["threshold"])
-    first = None if first is None else first + win
-    quiet = int(((fast >= sig["threshold"]) & ~loud).sum())
-    print("matrix scorer vs the per hop loop: max score difference %d, first match at hop %s vs %s, "
-          "%d quiet hops over the threshold ignored" % (delta, first, matched, quiet))
-    if delta or first != matched or matched is None or not quiet:
-        sys.exit("scorers disagree, or the test no longer reaches every branch")
-
-    # --alignment local: the column-at-a-time scorer against the recursion
-    # written cell by cell, on the same call and, to exercise the batching of
-    # calls of unequal length, on the call and a prefix of it together.
+    # sig_detector_frame(), cell by cell and hop by hop, against the scorer
+    # which computes a column at a time, on the call and, to exercise the
+    # batching of calls of unequal length, on the call and a prefix of it.
     lv = lift(v)
-    T, act = tmpl.lifted, tmpl.act
+    T, act, win = tmpl.lifted, tmpl.act, tmpl.win
     prev1 = prev2 = [(-np.inf, 0.0, 0)] * len(T)
-    direct = []
+    direct, hits, matched = [], 0, None
     for j in range(len(lv)):
         g = act * (T @ lv[j] - THETA)
         cur, score_best = [], 0.0
@@ -888,18 +913,54 @@ def self_test():
                 if way[0] > h:
                     h, a, start = way
             cur.append((h + g[i], a + act[i], start))
-            if i - start + 1 >= win and a + act[i] > 0:
+            if i - start + 1 >= win and 2 * (a + act[i]) >= win:
                 score_best = max(score_best, 100.0 * (THETA + (h + g[i]) / (a + act[i])))
-        direct.append(score_best)
         prev1, prev2 = cur, prev1
-    direct = np.array(direct[win - 1:])
+        count = j + 1
+        if count < win:
+            continue
+        direct.append(score_best)
+        if level[count - win: count].mean() < sig["silence_threshold"]:
+            hits = 0
+        elif score_best >= sig["threshold"]:
+            hits += 1
+            if hits >= DEBOUNCE and matched is None:
+                matched = count
+        else:
+            hits = 0
+    direct = np.array(direct)
     whole, part = score_local(tmpl, [lv, lv[:len(lv) // 2]])
     delta = max(np.abs(whole - direct).max(), np.abs(part - whole[:len(part)]).max())
     first = first_hit(whole, loud, sig["threshold"])
-    print("local alignment vs the cell by cell recursion: max score difference %.1e, "
-          "first match at hop %s" % (delta, None if first is None else first + win))
-    if delta > 1e-9 or first is None:
-        sys.exit("local alignment scorers disagree, or the reference is not found")
+    first = None if first is None else first + win
+    quiet = int(((whole >= sig["threshold"]) & ~loud).sum())
+    print("column scorer vs the cell by cell recursion: max score difference %.1e, first match at hop "
+          "%s vs %s, %d quiet hops over the threshold ignored" % (delta, first, matched, quiet))
+    if delta > 1e-9 or first != matched or matched is None or not quiet:
+        sys.exit("scorers disagree, or the test no longer reaches every branch")
+
+    # A reference written as a .sig and read back scores as the one it came
+    # from, to the five digits written, and a .sig made for another front
+    # end is refused.
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "ref.sig")
+    write_sig(path, tmpl.frames, tmpl.total, "ref", 0, [("hand", "ref")])
+    back = load_template(path, sig)
+    again = score_local(back, [lv])[0]
+    drift = np.abs(again - whole).max()
+    with open(path) as fh:
+        text = fh.read().replace("bands=%d" % NBANDS, "bands=%d" % (NBANDS + 1))
+    with open(path, "w") as fh:
+        fh.write(text)
+    try:
+        read_sig(path)
+        refused = False
+    except ValueError:
+        refused = True
+    shutil.rmtree(tmpdir)
+    print(".sig round trip: max score difference %.1e; other front end refused: %s" % (drift, refused))
+    if drift > 0.01 or not refused:
+        sys.exit(".sig files do not round trip")
 
     # --average: the reference placed among unrelated frames is found where it
     # was put, and averaging it with itself, and with a copy played slower,
@@ -928,19 +989,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--corpus", metavar="DIR", help="directory of <call>.wav plus <call>.json")
-    ap.add_argument("--templates", nargs="+", metavar="WAV",
-                    help="reference set to evaluate; without it, one is chosen from the corpus")
+    ap.add_argument("--templates", nargs="+", metavar="FILE",
+                    help="reference set to evaluate, recordings (.wav) or .sig files; without it, "
+                         "one is chosen from the corpus")
     ap.add_argument("--config", default="amd.conf",
-                    help="amd.conf whose [general] and [signature] to replay (default amd.conf); "
-                         "the templates key is ignored, give --templates instead")
+                    help="amd.conf whose [general] and [signature] to replay (default amd.conf)")
     ap.add_argument("--thresholds", help="thresholds to evaluate, decimals allowed (default: the "
                                          "configured one and two points either side)")
-    ap.add_argument("--alignment", choices=("rigid", "local"), default="rigid",
-                    help="rigid, as AMD() matches, or local: open-begin warped alignment "
-                         "over liftered frames (default rigid)")
     ap.add_argument("--average", action="store_true",
-                    help="replace each of --templates by the average of its voice's positive "
-                         "calls, evaluated leave-one-out")
+                    help="replace each of --templates, one seed recording per voice, by the "
+                         "average of its voice's positive calls, evaluated leave-one-out")
+    ap.add_argument("--write-averages", metavar="DIR",
+                    help="with --average, write each voice's average as DIR/<seed>.sig")
     ap.add_argument("--positive-label", default="SCREENED",
                     help="sidecar label marking a screened call (default SCREENED)")
     ap.add_argument("--self-test", action="store_true",
@@ -954,34 +1014,38 @@ def main():
         ap.error("give --corpus, or --self-test")
     if args.average and not args.templates:
         ap.error("--average needs --templates, one per voice")
+    if args.write_averages and not args.average:
+        ap.error("--write-averages needs --average")
 
     cfg = amd_replay.read_config(args.config)
     sig = read_signature_config(args.config)
     report_at = sig["threshold"]
-    steps = (-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2) if args.alignment == "local" else (-2, -1, 0, 1, 2)
     thresholds = sorted({float(t) for t in args.thresholds.split(",")} | {report_at}) \
-        if args.thresholds else [report_at + d for d in steps if 0 <= report_at + d <= 100]
+        if args.thresholds else [report_at + d for d in (-2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2)
+                                 if 0 <= report_at + d <= 100]
     print("config: %s%s" % (args.config, "" if os.path.exists(args.config) else " (not found, defaults)"))
-    print("signature: %s" % " ".join("%s=%d" % kv for kv in sig.items()))
+    print("signature: %s" % " ".join("%s=%g" % kv for kv in sig.items()))
 
     calls = load_corpus(args.corpus, cfg, sig)
     if not calls:
         sys.exit("no <call>.wav / <call>.json pairs under %s" % args.corpus)
     for c in calls:
         c["path"] = os.path.join(args.corpus, c["name"] + ".wav")
-    print("corpus: %d calls   %s" % (len(calls), dict(collections.Counter(c["label"] for c in calls))))
-    print("alignment: %s%s\n" % (args.alignment, " (theta %.2f, penalty %.2f)" % (THETA, WARP_PENALTY)
-                                 if args.alignment == "local" else ""))
+    print("corpus: %d calls   %s\n" % (len(calls), dict(collections.Counter(c["label"] for c in calls))))
 
     if args.templates:
-        templates = [Template(os.path.basename(p)[:-4] if p.endswith(".wav") else os.path.basename(p),
-                              read_wav(p), sig) for p in args.templates]
+        try:
+            templates = [load_template(p, sig) for p in args.templates]
+        except ValueError as exc:
+            sys.exit(str(exc))
         if args.average:
-            cmd_average(templates, calls, sig, thresholds, report_at, args.positive_label, args.alignment)
+            if any(p.endswith(".sig") for p in args.templates):
+                sys.exit("--average needs seed recordings, not .sig files")
+            cmd_average(templates, calls, sig, thresholds, report_at, args.positive_label, args.write_averages)
         else:
-            cmd_templates(templates, calls, thresholds, report_at, args.positive_label, args.alignment)
+            cmd_templates(templates, calls, thresholds, report_at, args.positive_label)
     else:
-        cmd_select(calls, sig, thresholds, report_at, args.positive_label, args.alignment)
+        cmd_select(calls, sig, thresholds, report_at, args.positive_label)
 
 
 if __name__ == "__main__":
